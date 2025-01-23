@@ -1,0 +1,690 @@
+import os
+import sys
+import time
+import math
+import signal
+import logging
+import csv
+import subprocess
+from logging.handlers import RotatingFileHandler
+from datetime import datetime
+from collections import Counter, deque
+
+# For the Block Frequency and other tests
+try:
+    from scipy.stats import chi2, norm
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
+
+# Attempt to import psutil for system metrics
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+
+# For optional plotting
+try:
+    import matplotlib
+    matplotlib.use('Agg')  # Use a non-interactive backend (Agg) for PNG output
+    import matplotlib.pyplot as plt
+    MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    MATPLOTLIB_AVAILABLE = False
+
+# =============================================================================
+# Configuration
+# =============================================================================
+
+HWRNG_PATH = "/dev/hwrng"
+BYTES_PER_READ = 4096
+ACCUMULATE_BITS = 1024 * 1024
+CSV_FILENAME = "random_monitor_results.csv"
+SLEEP_SECONDS = 1
+LOW_ENTROPY_THRESHOLD = 6.0
+POOR_RANDOMNESS_THRESHOLD = 0.01
+AUTO_CALIBRATE = True
+CALIBRATION_SAMPLES = 5
+
+# Anomaly detection configuration
+ANOMALY_WINDOW_SIZE = 50   # Number of recent readings to keep for anomaly detection
+ANOMALY_ZSCORE_THRESHOLD = 3.0  # Trigger anomaly if value is >3 stdev from mean
+
+# Graphical updates
+PLOT_UPDATE_INTERVAL = 30  # Update the plot every N readings
+
+# Global flag for graceful shutdown
+keep_running = True
+
+
+# =============================================================================
+# Logging Setup
+# =============================================================================
+
+def init_logger():
+    """
+    Initialize a rotating file logger plus console output.
+    """
+    logger = logging.getLogger("random_monitor")
+    logger.setLevel(logging.INFO)
+
+    # Remove any old handlers to avoid duplication
+    logger.handlers = []
+
+    file_handler = RotatingFileHandler(
+        "random_monitor_research.log",
+        maxBytes=5_000_000,
+        backupCount=5
+    )
+    file_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    file_handler.setFormatter(file_formatter)
+
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(file_formatter)
+
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+
+    return logger
+
+
+# =============================================================================
+# Randomness Test Functions
+# =============================================================================
+
+def compute_shannon_entropy(byte_data):
+    """
+    Compute the Shannon entropy of the given byte_data.
+    Formula: H = -sum(p_i * log2(p_i))
+    """
+    counts = Counter(byte_data)
+    total = len(byte_data)
+    return -sum((count / total) * math.log2(count / total) for count in counts.values() if count > 0)
+
+
+def compute_min_entropy(byte_data):
+    """
+    Compute the min-entropy of the given byte_data.
+    Formula: H_min = -log2( max p_i )
+    """
+    counts = Counter(byte_data)
+    total = len(byte_data)
+    max_freq = max(counts.values()) / total
+    return -math.log2(max_freq)
+
+
+def compute_conditional_entropy(byte_data):
+    """
+    Compute the conditional entropy based on adjacent pairs of bytes.
+    Formula: H(Y|X) = -sum_{a,b} p(a,b) * log2(p(b|a)) where p(b|a) = p(a,b) / p(a).
+    """
+    if len(byte_data) < 2:
+        return 0.0  # Not enough data for pairs
+
+    pairs = Counter(zip(byte_data[:-1], byte_data[1:]))
+    total_pairs = sum(pairs.values())
+
+    single_counts = Counter(byte_data)
+    total = len(byte_data)
+
+    conditional_entropy = 0.0
+    for (a, b), pair_count in pairs.items():
+        p_ab = pair_count / total_pairs
+        p_a = single_counts[a] / total
+        conditional_entropy += p_ab * math.log2(p_ab / p_a)
+
+    return -conditional_entropy
+
+
+def bits_from_bytes(byte_data):
+    """
+    Convert bytes into a list of bits (0 or 1).
+    """
+    return [(b >> i) & 1 for b in byte_data for i in range(8)]
+
+
+def frequency_monobit_test(bit_list):
+    """
+    Frequency (Monobit) Test.
+    Returns p-value based on the test statistic.
+    """
+    n = len(bit_list)
+    s = sum(1 if bit == 1 else -1 for bit in bit_list)
+    sobs = abs(s) / math.sqrt(n)
+    return math.erfc(sobs / math.sqrt(2))
+
+
+def runs_test(bit_list):
+    """
+    Runs Test.
+    Returns p-value based on the number of runs.
+    """
+    n = len(bit_list)
+    pi = sum(bit_list) / n
+    if pi in (0, 1):
+        return 0.0
+
+    runs = 1 + sum(bit_list[i] != bit_list[i - 1] for i in range(1, n))
+    expected_runs = 2 * n * pi * (1 - pi) + 0.5
+    var_runs = 2 * n * pi * (1 - pi) * (2 * n - 2) / (n - 1)
+    z = abs(runs - expected_runs) / math.sqrt(var_runs)
+    return math.erfc(z / math.sqrt(2))
+
+
+def block_frequency_test(bit_list, block_size=128):
+    """
+    Block Frequency Test (NIST SP 800-22 approach).
+    Returns p-value or None if we lack enough bits.
+    """
+    if not SCIPY_AVAILABLE:
+        return None  # Requires scipy
+
+    n = len(bit_list)
+    if n < block_size:
+        return None  # Not enough bits
+
+    num_blocks = n // block_size
+    chi_sq = 0.0
+    for i in range(num_blocks):
+        block = bit_list[i * block_size : (i + 1) * block_size]
+        p_i = sum(block) / block_size
+        chi_sq += (p_i - 0.5)**2
+
+    test_stat = 4 * block_size * chi_sq
+    return chi2.sf(test_stat, df=num_blocks)
+
+
+# -----------------------------------------------------------------------------
+# Additional Tests (per #5)
+# -----------------------------------------------------------------------------
+
+def cumulative_sums_test(bit_list):
+    """
+    NIST SP 800-22: Cumulative Sums Test (Forward version).
+    Returns p-value or None if there's insufficient data.
+    
+    The test statistic is the max absolute partial sum deviation from 0.
+    """
+    if not SCIPY_AVAILABLE or len(bit_list) < 1:
+        return None
+
+    n = len(bit_list)
+    # Map bits from {0,1} to {+1,-1}
+    mapped_bits = [1 if b == 1 else -1 for b in bit_list]
+    partial_sums = []
+    running_sum = 0
+    for x in mapped_bits:
+        running_sum += x
+        partial_sums.append(running_sum)
+
+    abs_max = max(abs(s) for s in partial_sums)
+    # The p-value approximation from NIST SP 800-22 (eq. 10.1)
+    # p-value = 1 - sum_{k=(-n_0 - floor(n0/4))}^{(n_0+floor(n_0/4))} 
+    #           of ...
+    # However, the simpler approach often used:
+    z = abs_max / math.sqrt(n)
+    return 2 * (1 - norm.cdf(z))
+
+
+def approximate_entropy_test(bit_list, m=2):
+    """
+    Approximate Entropy Test (NIST SP 800-22).
+    We compute phi_m for template length m and m+1, then compute test statistic.
+    Returns p-value or None if there's insufficient data.
+
+    For a large bit_list, consider sub-sampling or an efficient approach. 
+    """
+    if not SCIPY_AVAILABLE or len(bit_list) < (m + 1):
+        return None
+
+    n = len(bit_list)
+
+    def _phi(k):
+        # Concatenate the sequence to handle wrap-around
+        extended = bit_list + bit_list[:k-1]
+        ccounts = {}
+        for i in range(n):
+            # Extract k-bit pattern
+            pattern = tuple(extended[i:i+k])
+            ccounts[pattern] = ccounts.get(pattern, 0) + 1
+        return sum((count / n) * math.log(count / n) for count in ccounts.values() if count != 0)
+
+    phi_m = _phi(m)
+    phi_m1 = _phi(m+1)
+    apen = phi_m - phi_m1  # Approximate Entropy
+    test_stat = 2 * n * (math.log(2) - apen)
+    # Degrees of freedom = 2^(m+1) - 2^m = 2^m(2 - 1) = 2^m
+    df = 2**m
+    return chi2.sf(test_stat, df=df)
+
+
+def safe_test_call(test_func, *args, logger=None, default=None):
+    """
+    Safely call a test function. If there's an error, log it and return a default.
+    """
+    try:
+        return test_func(*args)
+    except Exception as e:
+        if logger:
+            logger.error(f"Error in {test_func.__name__}: {e}")
+        return default
+
+
+# =============================================================================
+# Raspberry Pi System Metrics
+# =============================================================================
+
+def get_rpi_cpu_temp_from_vcgencmd(logger=None):
+    """
+    Attempt to read CPU temp via 'vcgencmd measure_temp'.
+    Returns float temperature in Celsius or None if unavailable.
+    """
+    try:
+        result = subprocess.check_output(["vcgencmd", "measure_temp"], universal_newlines=True)
+        if "temp=" in result:
+            temp_str = result.split("=")[1].strip().replace("'C", "")
+            return float(temp_str)
+    except FileNotFoundError:
+        if logger:
+            logger.warning("vcgencmd not found on the system.")
+    except Exception as e:
+        if logger:
+            logger.warning(f"Failed to read CPU temperature from vcgencmd: {e}")
+
+    return None
+
+
+def get_rpi_cpu_temp_from_sysfs(logger=None):
+    """
+    Attempt to read CPU temp from /sys/class/thermal/thermal_zone0/temp.
+    Returns float temperature in Celsius or None if unavailable.
+    """
+    path = "/sys/class/thermal/thermal_zone0/temp"
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r") as f:
+            content = f.read().strip()
+        temp_millideg = float(content)
+        return temp_millideg / 1000.0
+    except Exception as e:
+        if logger:
+            logger.warning(f"Failed to read CPU temperature from sysfs: {e}")
+    return None
+
+
+def get_system_metrics(logger=None):
+    """
+    Collect system metrics (CPU temp, CPU usage, memory usage, load avg).
+    On Raspberry Pi, we attempt psutil, then vcgencmd, then sysfs for CPU temp.
+    """
+    metrics = {
+        "cpu_temp": "N/A",
+        "cpu_usage_percent": "N/A",
+        "mem_usage_percent": "N/A",
+        "load_avg_1m": "N/A",
+        "load_avg_5m": "N/A",
+        "load_avg_15m": "N/A",
+    }
+
+    cpu_temp_read = None
+
+    # 1) Use psutil if available
+    if PSUTIL_AVAILABLE:
+        try:
+            # CPU usage
+            cpu_usage = psutil.cpu_percent(interval=None)
+            metrics["cpu_usage_percent"] = round(cpu_usage, 1)
+
+            # Memory usage
+            mem = psutil.virtual_memory()
+            metrics["mem_usage_percent"] = round(mem.percent, 1)
+
+            # Load average
+            if hasattr(psutil, "getloadavg"):
+                la = psutil.getloadavg()
+                metrics["load_avg_1m"] = round(la[0], 2)
+                metrics["load_avg_5m"] = round(la[1], 2)
+                metrics["load_avg_15m"] = round(la[2], 2)
+
+            # CPU temp from psutil
+            if hasattr(psutil, "sensors_temperatures"):
+                temps = psutil.sensors_temperatures()
+                if temps:
+                    for key in ("cpu_thermal", "thermal_zone0", "coretemp", "cpu-thermal"):
+                        if key in temps and len(temps[key]) > 0:
+                            cpu_temp_read = temps[key][0].current
+                            break
+        except Exception as e:
+            if logger:
+                logger.warning(f"Failed to gather some psutil metrics: {e}")
+    else:
+        if logger:
+            logger.warning("psutil not available; system metrics might be incomplete.")
+
+    # 2) If psutil didn't give us a CPU temp, try vcgencmd
+    if cpu_temp_read is None:
+        cpu_temp_read = get_rpi_cpu_temp_from_vcgencmd(logger=logger)
+
+    # 3) If still None, try reading sysfs
+    if cpu_temp_read is None:
+        cpu_temp_read = get_rpi_cpu_temp_from_sysfs(logger=logger)
+
+    # Finalize CPU temp in dictionary
+    if cpu_temp_read is not None:
+        metrics["cpu_temp"] = round(cpu_temp_read, 1)
+
+    return metrics
+
+
+# =============================================================================
+# Signal Handling
+# =============================================================================
+
+def signal_handler(sig, frame):
+    """
+    Handle Ctrl+C / kill signals for graceful exit.
+    """
+    global keep_running
+    logging.getLogger("random_monitor").info("Shutdown signal received. Stopping monitor...")
+    keep_running = False
+
+
+# =============================================================================
+# CSV Utilities
+# =============================================================================
+
+def init_csv_file(filename, fieldnames, logger):
+    """
+    Initialize a CSV file with the given fieldnames if it doesn't already exist.
+    Returns a tuple (file_handle, dict_writer).
+    """
+    file_exists = os.path.isfile(filename)
+    csv_file = open(filename, "a", newline="")
+    writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+
+    if not file_exists:
+        logger.info(f"Creating new CSV file with header: {filename}")
+        writer.writeheader()
+
+    return csv_file, writer
+
+
+def write_csv_row(writer, row_data, csv_file):
+    """
+    Write a single row of data and flush to ensure durability.
+    """
+    writer.writerow(row_data)
+    csv_file.flush()
+
+
+# =============================================================================
+# Anomaly Detection (#6)
+# =============================================================================
+
+class AnomalyDetector:
+    """
+    Simple anomaly detector based on a rolling window and z-scores.
+    Retains a deque of the last N values and detects if current
+    reading is > some threshold stdevs away from mean.
+    """
+
+    def __init__(self, window_size=50, z_threshold=3.0):
+        self.window_size = window_size
+        self.z_threshold = z_threshold
+        self.values = deque()
+
+    def update_and_check(self, new_value):
+        """
+        Update the rolling window with 'new_value' and return True if it's an anomaly.
+        """
+        self.values.append(new_value)
+        if len(self.values) > self.window_size:
+            self.values.popleft()
+
+        if len(self.values) < 2:
+            return False  # Not enough data for anomaly detection
+
+        mean_val = sum(self.values) / len(self.values)
+        variance = sum((x - mean_val)**2 for x in self.values) / (len(self.values) - 1)
+        stddev = math.sqrt(variance) if variance > 0 else 0
+
+        if stddev == 0:
+            return False
+
+        z_score = abs((new_value - mean_val) / stddev)
+        return (z_score > self.z_threshold)
+
+
+# =============================================================================
+# Graphical Visualization (#3)
+# =============================================================================
+
+def plot_entropy(time_points, entropy_values, filename="random_monitor_plot.png"):
+    """
+    Plot the Shannon entropy over time and save to a PNG file.
+    """
+    if not MATPLOTLIB_AVAILABLE or len(time_points) == 0:
+        return
+
+    plt.figure(figsize=(8, 4))
+    plt.plot(time_points, entropy_values, marker='o', linestyle='-', color='blue')
+    plt.title("Shannon Entropy Over Time")
+    plt.xlabel("Time (UTC)")
+    plt.ylabel("Entropy (bits/byte)")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.xticks(rotation=45, ha='right')
+    plt.savefig(filename)
+    plt.close()
+
+
+# =============================================================================
+# Main Monitoring Logic
+# =============================================================================
+
+def read_random_data(logger):
+    """
+    Safe read from /dev/hwrng. Returns bytes or None on failure.
+    """
+    if not os.path.exists(HWRNG_PATH):
+        logger.error(f"{HWRNG_PATH} does not exist.")
+        return None
+
+    try:
+        with open(HWRNG_PATH, "rb") as hwrng:
+            chunk = hwrng.read(BYTES_PER_READ)
+        if not chunk:
+            logger.warning("Read 0 bytes from hardware RNG.")
+            return None
+        return chunk
+    except Exception as e:
+        logger.error(f"Error reading from {HWRNG_PATH}: {e}")
+        return None
+
+
+def auto_calibrate_thresholds(logger):
+    """
+    Optionally calibrate LOW_ENTROPY_THRESHOLD by sampling hardware RNG.
+    """
+    global LOW_ENTROPY_THRESHOLD
+
+    if not AUTO_CALIBRATE or CALIBRATION_SAMPLES <= 0:
+        return
+
+    logger.info("Auto-calibration of entropy threshold started...")
+    total_entropy = 0.0
+    samples_collected = 0
+
+    for _ in range(CALIBRATION_SAMPLES):
+        chunk = read_random_data(logger)
+        if chunk:
+            entropy = compute_shannon_entropy(chunk)
+            total_entropy += entropy
+            samples_collected += 1
+
+    if samples_collected > 0:
+        avg_entropy = total_entropy / samples_collected
+        # Example strategy: set threshold to 80% of observed average
+        new_threshold = 0.8 * avg_entropy
+        logger.info(f"Auto-calibration complete. Old threshold={LOW_ENTROPY_THRESHOLD:.2f}, "
+                    f"New threshold={new_threshold:.2f} (avg observed={avg_entropy:.2f})")
+        LOW_ENTROPY_THRESHOLD = new_threshold
+    else:
+        logger.warning("No calibration samples collected. Threshold remains unchanged.")
+
+
+def run_monitor(logger):
+    """
+    Main loop that continuously reads from HWRNG, computes metrics, logs results, and writes CSV.
+    Also provides anomaly detection (#6) and optional plotting (#3).
+    """
+    global keep_running
+
+    # Auto-calibrate thresholds if requested
+    auto_calibrate_thresholds(logger)
+
+    # Prepare CSV logging
+    fieldnames = [
+        "timestamp",
+        "entropy",
+        "min_entropy",
+        "cond_entropy",
+        "monobit_p",
+        "runs_p",
+        "block_freq_p",
+        "cum_sums_p",
+        "approx_ent_p",
+        "cpu_temp",
+        "cpu_usage_percent",
+        "mem_usage_percent",
+        "load_avg_1m",
+        "load_avg_5m",
+        "load_avg_15m"
+    ]
+    csv_file, csv_writer = init_csv_file(CSV_FILENAME, fieldnames, logger)
+
+    # Accumulated bits for occasional large-sample tests (if desired)
+    accumulated_bits = deque()
+
+    # Anomaly detectors
+    entropy_detector = AnomalyDetector(window_size=ANOMALY_WINDOW_SIZE, 
+                                       z_threshold=ANOMALY_ZSCORE_THRESHOLD)
+    pval_detector = AnomalyDetector(window_size=ANOMALY_WINDOW_SIZE,
+                                    z_threshold=ANOMALY_ZSCORE_THRESHOLD)
+
+    # For plotting
+    entropy_time_points = []
+    entropy_values = []
+    reading_count = 0
+
+    logger.info(f"Monitoring {HWRNG_PATH}... (Press Ctrl+C to stop)")
+
+    try:
+        while keep_running:
+            chunk = read_random_data(logger)
+            if not chunk:
+                # Skip this iteration if read failed or returned nothing
+                time.sleep(SLEEP_SECONDS)
+                continue
+
+            reading_count += 1
+
+            # Convert to bits (for tests that need bits)
+            bit_list = bits_from_bytes(chunk)
+
+            # Extend accumulated bits
+            accumulated_bits.extend(bit_list)
+            if len(accumulated_bits) > ACCUMULATE_BITS:
+                # Clear if we exceed threshold
+                accumulated_bits.clear()
+
+            # Perform randomness tests
+            entropy = safe_test_call(compute_shannon_entropy, chunk, logger=logger, default=0.0)
+            min_entropy = safe_test_call(compute_min_entropy, chunk, logger=logger, default=0.0)
+            cond_entropy = safe_test_call(compute_conditional_entropy, chunk, logger=logger, default=0.0)
+
+            p_val_monobit = safe_test_call(frequency_monobit_test, bit_list, logger=logger, default=None)
+            p_val_runs = safe_test_call(runs_test, bit_list, logger=logger, default=None)
+            p_val_blockfreq = safe_test_call(block_frequency_test, bit_list, 128, logger=logger, default=None)
+            p_val_cumsums = safe_test_call(cumulative_sums_test, bit_list, logger=logger, default=None)
+            p_val_approx_ent = safe_test_call(approximate_entropy_test, bit_list, 2, logger=logger, default=None)
+
+            # Gather system metrics
+            system_metrics = get_system_metrics(logger=logger)
+
+            # Prepare CSV row
+            now_str = datetime.utcnow().isoformat()
+            row = {
+                "timestamp": now_str,
+                "entropy": round(entropy, 6),
+                "min_entropy": round(min_entropy, 6),
+                "cond_entropy": round(cond_entropy, 6),
+                "monobit_p": f"{p_val_monobit:.6g}" if p_val_monobit is not None else "",
+                "runs_p": f"{p_val_runs:.6g}" if p_val_runs is not None else "",
+                "block_freq_p": f"{p_val_blockfreq:.6g}" if p_val_blockfreq is not None else "",
+                "cum_sums_p": f"{p_val_cumsums:.6g}" if p_val_cumsums is not None else "",
+                "approx_ent_p": f"{p_val_approx_ent:.6g}" if p_val_approx_ent is not None else "",
+                "cpu_temp": system_metrics["cpu_temp"],
+                "cpu_usage_percent": system_metrics["cpu_usage_percent"],
+                "mem_usage_percent": system_metrics["mem_usage_percent"],
+                "load_avg_1m": system_metrics["load_avg_1m"],
+                "load_avg_5m": system_metrics["load_avg_5m"],
+                "load_avg_15m": system_metrics["load_avg_15m"],
+            }
+            write_csv_row(csv_writer, row, csv_file)
+
+            # Log a concise summary
+            logger.info(
+                f"[{now_str}] E={entropy:.2f}, E_min={min_entropy:.2f}, cE={cond_entropy:.2f}, "
+                f"mono_p={p_val_monobit}, runs_p={p_val_runs}, blockF_p={p_val_blockfreq}, "
+                f"cumSum_p={p_val_cumsums}, approxEnt_p={p_val_approx_ent}, CPU={system_metrics['cpu_temp']}"
+            )
+
+            # Check entropy anomaly
+            if entropy_detector.update_and_check(entropy):
+                logger.warning(f"[ANOMALY] Entropy outlier detected: {entropy:.2f} bits/byte.")
+
+            # If p_val_monobit is available, check for p-value anomaly
+            if p_val_monobit is not None:
+                if pval_detector.update_and_check(p_val_monobit):
+                    logger.warning(f"[ANOMALY] Monobit p-value outlier detected: {p_val_monobit:.3g}.")
+
+            # Alert if below threshold
+            if entropy < LOW_ENTROPY_THRESHOLD:
+                logger.warning(f"[ALERT] Low entropy detected: {entropy:.2f} bits/byte "
+                               f"(threshold={LOW_ENTROPY_THRESHOLD:.2f}).")
+
+            # Append to plotting lists
+            entropy_time_points.append(now_str)
+            entropy_values.append(entropy)
+
+            # Periodically update a plot of the last 100 data points
+            if MATPLOTLIB_AVAILABLE and (reading_count % PLOT_UPDATE_INTERVAL == 0):
+                plot_entropy(entropy_time_points[-100:], entropy_values[-100:],
+                             filename="random_monitor_plot.png")
+
+            # Sleep
+            time.sleep(SLEEP_SECONDS)
+
+    except Exception as e:
+        logger.error(f"Unexpected error in main loop: {e}")
+    finally:
+        # Ensure everything is closed properly
+        csv_file.close()
+        logger.info("Monitor stopped.")
+
+
+def main():
+    logger = init_logger()
+
+    # Register signals
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    run_monitor(logger)
+
+
+if __name__ == "__main__":
+    main()
